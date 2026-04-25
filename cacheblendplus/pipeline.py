@@ -4,26 +4,14 @@ Fixed for Transformers >= 4.45 which requires DynamicCache instead of tuple past
 
 import time
 import torch
-from kv_store import pack_kv, unpack_kv
-
-
-def _to_dynamic_cache(packed_kv):
-    from transformers import DynamicCache
-    cache = DynamicCache()
-    L = packed_kv.shape[0]
-    for layer_idx in range(L):
-        k = packed_kv[layer_idx, 0].permute(1, 0, 2).unsqueeze(0)  # (1, H, N, D)
-        v = packed_kv[layer_idx, 1].permute(1, 0, 2).unsqueeze(0)
-        cache.update(k, v, layer_idx)
-    return cache
-
-
+from .kv_store import pack_kv, unpack_kv
+from .blend_kernel import blend
 
 class KVBlender:
     def blend(self, cached_kv, new_values, indices):
-        updated = cached_kv.clone()
-        updated[:, :, indices, :, :] = new_values
-        return updated
+        # The blend_kernel.py implementation handles both CUDA and CPU
+        # Note: it might modify cached_kv in-place for efficiency
+        return blend(cached_kv, new_values, indices)
 
 
 def cacheblend_generate(
@@ -74,7 +62,7 @@ def cacheblend_generate(
     )["input_ids"].cuda()
 
     # Convert to DynamicCache — required by Transformers >= 4.45
-    past = _to_dynamic_cache(fused_kv) if fused_kv is not None else None
+    past = unpack_kv(fused_kv) if fused_kv is not None else None
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()

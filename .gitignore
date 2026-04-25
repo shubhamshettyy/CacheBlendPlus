@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# CUDA / C++ Build artifacts
+*.o
+*.obj
+*.so
+*.pyd
+*.exp
+*.lib
+*.ninja
+.ninja_deps
+.ninja_log
+build/
+torch_extensions/
+
+# IDEs
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/

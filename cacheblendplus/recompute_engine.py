@@ -6,8 +6,7 @@ Interface:
 """
 
 import torch
-from kv_store import pack_kv, unpack_kv # Adi's helpers
-from pipeline import _to_dynamic_cache
+from .kv_store import pack_kv, unpack_kv 
 
 class SelectiveRecomputer:
     """
@@ -40,8 +39,7 @@ class SelectiveRecomputer:
         selected_ids = chunk_ids[:, indices]  # (1, k)
 
         # Unpack to HuggingFace tuple format so we can pass as past_key_values as this makes the model attend over the FULL cached context, not just k tokens
-        #past = unpack_kv(cached_kv)
-        past = _to_dynamic_cache(cached_kv) #added to fix transformers 4.45+ compatibility, which switched to DynamicCache for past_key_values instead of tuples
+        past = unpack_kv(cached_kv) #added to fix transformers 4.45+ compatibility, which switched to DynamicCache for past_key_values instead of tuples
 
         with torch.no_grad():
             out = self.model(
