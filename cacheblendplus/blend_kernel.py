@@ -1,30 +1,48 @@
 import os
 import torch
-
-# Windows Environment Setup for JIT compilation - MUST happen before importing cpp_extension
-if os.name == "nt":
-    os.environ["CUDA_HOME"] = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-    cl_path = r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.43.34808\bin\Hostx64\x64"
-    if cl_path not in os.environ["PATH"]:
-        os.environ["PATH"] = cl_path + os.pathsep + os.environ["PATH"]
-
 from torch.utils.cpp_extension import load
 
 # JIT compile the CUDA extension
 _module = None
-try:
-    # Get the directory of the current file
-    _curr_dir = os.path.dirname(os.path.abspath(__file__))
-    _cuda_src = os.path.join(_curr_dir, "blend.cu")
-    
-    if os.path.exists(_cuda_src):
-        _module = load(
+_load_error = None
+
+
+def _load_cuda_module():
+    """
+    Best-effort CUDA extension loading.
+
+    This is intentionally environment-agnostic:
+    - no hardcoded CUDA/MSVC paths
+    - respects user/system toolchain configuration
+    - clean fallback to PyTorch scatter when build tools are unavailable
+    """
+    curr_dir = os.path.dirname(os.path.abspath(__file__))
+    cuda_src = os.path.join(curr_dir, "blend.cu")
+
+    if not os.path.exists(cuda_src):
+        return None, "blend.cu not found"
+
+    if not torch.cuda.is_available():
+        return None, "CUDA is not available"
+
+    # Allow users/CI to opt out of JIT compilation.
+    if os.environ.get("CACHEBLEND_DISABLE_CUDA_EXT", "").lower() in {"1", "true", "yes"}:
+        return None, "CUDA extension disabled by CACHEBLEND_DISABLE_CUDA_EXT"
+
+    try:
+        mod = load(
             name="blend_cuda",
-            sources=[_cuda_src],
-            verbose=True
+            sources=[cuda_src],
+            verbose=os.environ.get("CACHEBLEND_VERBOSE_EXT", "0") == "1",
         )
-except Exception as e:
-    print(f"Failed to load CUDA blend kernel: {e}")
+        return mod, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+_module, _load_error = _load_cuda_module()
+if _module is None:
+    print(f"Failed to load CUDA blend kernel: {_load_error}")
     print("Falling back to PyTorch implementation.")
 
 def blend(cached_kv, new_values, indices):

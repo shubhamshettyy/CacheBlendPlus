@@ -23,7 +23,13 @@ def cacheblend_generate(
     selector,
     recomputer,
     blender=None,
+    mode: str = "cacheblend",  # "cacheblend" or "standard_cache"
     max_new_tokens=64,
+    min_new_tokens=8,
+    do_sample=True,
+    temperature=0.8,
+    top_p=0.95,
+    benchmark_first_token: bool = False,
 ):
     if blender is None:
         blender = KVBlender()
@@ -32,40 +38,61 @@ def cacheblend_generate(
     cache_misses = 0
     fused_kv = None
 
+    # End-to-end request latency includes cache/prefill work plus first token decode.
+    torch.cuda.synchronize()
+    t_request_start = time.perf_counter()
+
     for chunk_text in chunk_texts:
-        chunk_ids = tokenizer(
-            chunk_text, return_tensors="pt", truncation=True, max_length=512
-        )["input_ids"].cuda()
+        chunk_enc = tokenizer(
+            chunk_text,
+            return_tensors="pt",
+            return_attention_mask=True,
+            truncation=True,
+            max_length=512,
+        )
+        chunk_ids = chunk_enc["input_ids"].cuda()
+        chunk_attn = chunk_enc["attention_mask"].cuda()
 
         cached = store.load(chunk_text, device="cuda")
 
         if cached is None:
             cache_misses += 1
             with torch.no_grad():
-                out = model(chunk_ids, use_cache=True)
+                out = model(chunk_ids, attention_mask=chunk_attn, use_cache=True)
             chunk_kv = pack_kv(out.past_key_values)
             store.store(chunk_text, chunk_kv)
         else:
             cache_hits += 1
             chunk_kv = cached
-            indices = selector.select(chunk_ids, chunk_kv)
-            new_kv = recomputer.recompute(chunk_ids, chunk_kv, indices)
-            chunk_kv = blender.blend(chunk_kv, new_kv, indices)
+            if mode == "cacheblend":
+                indices = selector.select(chunk_ids, chunk_kv)
+                new_kv = recomputer.recompute(chunk_ids, chunk_kv, indices)
+                chunk_kv = blender.blend(chunk_kv, new_kv, indices)
+            elif mode == "standard_cache":
+                pass
+            else:
+                raise ValueError(f"Unsupported mode: {mode}")
 
         if fused_kv is None:
             fused_kv = chunk_kv
         else:
             fused_kv = torch.cat([fused_kv, chunk_kv], dim=2)
 
-    prompt_ids = tokenizer(
-        prompt, return_tensors="pt", truncation=True, max_length=128
-    )["input_ids"].cuda()
+    prompt_enc = tokenizer(
+        prompt,
+        return_tensors="pt",
+        return_attention_mask=True,
+        truncation=True,
+        max_length=128,
+    )
+    prompt_ids = prompt_enc["input_ids"].cuda()
+    prompt_attn = prompt_enc["attention_mask"].cuda()
 
     # Convert to DynamicCache — required by Transformers >= 4.45
     past = unpack_kv(fused_kv) if fused_kv is not None else None
 
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    t_decode_start = time.perf_counter()
 
     # cache_position tells generate() where the prompt tokens sit
     # after the already-cached context (which has fused_kv.shape[2] tokens)
@@ -76,26 +103,38 @@ def cacheblend_generate(
         device=prompt_ids.device
     )
 
+    gen_max = 1 if benchmark_first_token else max_new_tokens
+    gen_min = 1 if benchmark_first_token else min_new_tokens
+    gen_sample = False if benchmark_first_token else do_sample
+
     with torch.no_grad():
         out_ids = model.generate(
             prompt_ids,
+            attention_mask=prompt_attn,
             past_key_values=past,
             cache_position=cache_position,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=gen_max,
+            min_new_tokens=gen_min,
             use_cache=True,
-            do_sample=False,
+            do_sample=gen_sample,
+            temperature=temperature,
+            top_p=top_p,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
     torch.cuda.synchronize()
-    ttft_ms = (time.perf_counter() - t0) * 1000
+    generate_only_ms = (time.perf_counter() - t_decode_start) * 1000
+    ttft_ms = (time.perf_counter() - t_request_start) * 1000
 
     generated = out_ids[0][prompt_ids.shape[1]:]
-    text = tokenizer.decode(generated, skip_special_tokens=True)
+    text = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     return {
         "text": text,
         "ttft_ms": ttft_ms,
+        "e2e_ttft_ms": ttft_ms,
+        "generate_only_ms": generate_only_ms,
         "cache_hits": cache_hits,
         "cache_misses": cache_misses,
     }
