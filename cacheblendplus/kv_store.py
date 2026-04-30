@@ -3,7 +3,7 @@ from typing import Optional
 
 def pack_kv(past_key_values) -> torch.Tensor:
     """HuggingFace past_key_values → (L, 2, N, H, D) float16."""
-    if hasattr(past_key_values, 'key_cache'):
+    if hasattr(past_key_values, 'key_cache') and hasattr(past_key_values, 'value_cache'):
         key_cache = past_key_values.key_cache
         val_cache = past_key_values.value_cache
         layers = []
@@ -14,8 +14,15 @@ def pack_kv(past_key_values) -> torch.Tensor:
             layers.append(torch.stack([k, v], dim=0)) # (2, N, H, D)
         return torch.stack(layers, dim=0) # (L, 2, N, H, D)
 
+    # Newer HF cache classes can expose tuple format via a helper.
+    if hasattr(past_key_values, "to_legacy_cache"):
+        past_key_values = past_key_values.to_legacy_cache()
+
     layers = []
     for layer_kv in past_key_values:
+        if not isinstance(layer_kv, (tuple, list)) or len(layer_kv) < 2:
+            raise ValueError("Unsupported cache layer format in past_key_values.")
+        # Some HF variants include extra fields per layer. Use first two entries.
         k, v = layer_kv[0], layer_kv[1]
         k = k.squeeze(0).transpose(0, 1)
         v = v.squeeze(0).transpose(0, 1)
