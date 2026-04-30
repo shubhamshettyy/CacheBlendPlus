@@ -107,21 +107,24 @@ def cacheblend_generate(
     gen_min = 1 if benchmark_first_token else min_new_tokens
     gen_sample = False if benchmark_first_token else do_sample
 
+    gen_kwargs = {
+        "attention_mask": prompt_attn,
+        "past_key_values": past,
+        "cache_position": cache_position,
+        "max_new_tokens": gen_max,
+        "min_new_tokens": gen_min,
+        "use_cache": True,
+        "do_sample": gen_sample,
+        "pad_token_id": tokenizer.eos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    # Avoid warnings about sampling-only flags during greedy decoding runs.
+    if gen_sample:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = top_p
+
     with torch.no_grad():
-        out_ids = model.generate(
-            prompt_ids,
-            attention_mask=prompt_attn,
-            past_key_values=past,
-            cache_position=cache_position,
-            max_new_tokens=gen_max,
-            min_new_tokens=gen_min,
-            use_cache=True,
-            do_sample=gen_sample,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        out_ids = model.generate(prompt_ids, **gen_kwargs)
 
     torch.cuda.synchronize()
     generate_only_ms = (time.perf_counter() - t_decode_start) * 1000
