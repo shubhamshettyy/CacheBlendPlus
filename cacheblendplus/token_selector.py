@@ -285,10 +285,11 @@ def select_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
 
 class CacheBlendFusor:
     def __init__(self, model, r: float = 0.15, r1_factor: float = 1.33):
-        self.model    = model
-        self.r        = r
-        self.r1       = min(r * r1_factor, 1.0)
-        self.layers   = get_model_layers(model)
+        self.model     = model
+        self.r         = r
+        self.r1_factor = r1_factor
+        self.r1        = min(r * r1_factor, 1.0)
+        self.layers    = get_model_layers(model)
         self.L        = len(self.layers)
 
         self.n_heads = model.config.num_attention_heads
@@ -316,10 +317,13 @@ class CacheBlendFusor:
         full_input_ids : torch.Tensor,
         KV_new         : torch.Tensor,
         hit_mask       : torch.Tensor,
+        r              : Optional[float] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        # r overrides self.r at call time — used by Extension C adaptive mode.
+        r_eff  = r if r is not None else self.r
+        r1_eff = min(r_eff * self.r1_factor, 1.0)
 
         N = full_input_ids.shape[1]
-        # KV_new = KV_new.float()
         KV_new = KV_new.to(self.model.dtype)
         hkvd_per_layer = []
 
@@ -328,7 +332,7 @@ class CacheBlendFusor:
         k_targets = []
         for i in range(1, self.L):
             progress = i / (self.L - 1) if self.L > 1 else 1.0
-            target_ratio = self.r1 + (self.r - self.r1) * progress
+            target_ratio = r1_eff + (r_eff - r1_eff) * progress
             k_targets.append(min(N, miss_count + max(1, int(target_ratio * N))))
 
         is_llama = self.rotary_emb is not None
@@ -354,7 +358,7 @@ class CacheBlendFusor:
             dev0 = compute_deviation_l2(
                 fresh_K0, fresh_V0, cached_K0, cached_V0, ~hit_mask
             )
-            k0 = min(N, miss_count + max(1, int(self.r1 * N)))
+            k0 = min(N, miss_count + max(1, int(r1_eff * N)))
             hkvd = select_topk(dev0, k0)
             hkvd_per_layer.append(hkvd)
 

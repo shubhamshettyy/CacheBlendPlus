@@ -23,7 +23,8 @@ def cacheblend_generate(
     selector,
     recomputer,
     blender=None,
-    mode: str = "cacheblend",  # "cacheblend" or "standard_cache"
+    fusor=None,
+    mode: str = "cacheblend",  # "cacheblend" | "cacheblend_hkvd" | "cacheblend_adaptive" | "standard_cache"
     max_new_tokens=64,
     min_new_tokens=8,
     do_sample=True,
@@ -68,6 +69,15 @@ def cacheblend_generate(
                 indices = selector.select(chunk_ids, chunk_kv)
                 new_kv = recomputer.recompute(chunk_ids, chunk_kv, indices)
                 chunk_kv = blender.blend(chunk_kv, new_kv, indices)
+            elif mode == "cacheblend_hkvd":
+                # Paper-faithful: HKVD gradual filtering via CacheBlendFusor, fixed r.
+                hit_mask = torch.ones(chunk_ids.shape[1], device=chunk_ids.device, dtype=torch.bool)
+                chunk_kv, _ = fusor.fuse(chunk_ids, chunk_kv, hit_mask)
+            elif mode == "cacheblend_adaptive":
+                # Extension C: adaptive r (cosine divergence) fed into HKVD fusor.
+                adaptive_r = selector.compute_r(chunk_ids, chunk_kv)
+                hit_mask = torch.ones(chunk_ids.shape[1], device=chunk_ids.device, dtype=torch.bool)
+                chunk_kv, _ = fusor.fuse(chunk_ids, chunk_kv, hit_mask, r=adaptive_r)
             elif mode == "standard_cache":
                 pass
             else:

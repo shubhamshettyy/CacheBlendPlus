@@ -70,6 +70,40 @@ class AdaptiveTokenSelector:
         alpha = (mean_divergence - self.low_thresh) / span
         return self.min_k_ratio + alpha * (self.max_k_ratio - self.min_k_ratio)
 
+    def compute_r(self, chunk_ids: torch.Tensor, cached_kv: torch.Tensor) -> float:
+        """
+        Compute adaptive recompute ratio without selecting indices.
+        Use with CacheBlendFusor.fuse(r=selector.compute_r(...)) for proper Extension C:
+            adaptive_r = selector.compute_r(chunk_ids, cached_kv)
+            blended_kv, stats = fusor.fuse(chunk_ids, cached_kv, hit_mask, r=adaptive_r)
+        """
+        if chunk_ids.ndim != 2 or chunk_ids.shape[0] != 1:
+            raise ValueError(f"Expected chunk_ids shape (1, N), got {tuple(chunk_ids.shape)}")
+        if cached_kv.ndim != 5 or cached_kv.shape[1] != 2:
+            raise ValueError(f"Expected cached_kv shape (L, 2, N, H, D), got {tuple(cached_kv.shape)}")
+
+        with torch.no_grad():
+            attn_mask = torch.ones_like(chunk_ids)
+            out = self.model(
+                chunk_ids,
+                attention_mask=attn_mask,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            fresh_hidden = out.hidden_states[1].squeeze(0).float()  # (N, d_model)
+
+        cached_k = cached_kv[0, 0].float()        # (N, H, D)
+        cached_hidden = cached_k.mean(dim=1)       # (N, D)
+        cached_hidden = self._project_cached_for_cosine(cached_hidden, fresh_hidden.shape[-1])
+
+        fresh_norm  = F.normalize(fresh_hidden  + self.eps, p=2, dim=-1)
+        cached_norm = F.normalize(cached_hidden + self.eps, p=2, dim=-1)
+        cosine    = F.cosine_similarity(fresh_norm, cached_norm, dim=-1)
+        divergence = (1.0 - cosine).clamp_min(0.0)
+        mean_div   = float(divergence.mean().item())
+        return self._adaptive_ratio(mean_div)
+
     def select(self, chunk_ids: torch.Tensor, cached_kv: torch.Tensor) -> torch.Tensor:
         """
         Args:
