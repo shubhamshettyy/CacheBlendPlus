@@ -74,10 +74,10 @@ def cacheblend_generate(
                 hit_mask = torch.ones(chunk_ids.shape[1], device=chunk_ids.device, dtype=torch.bool)
                 chunk_kv, _ = fusor.fuse(chunk_ids, chunk_kv, hit_mask)
             elif mode == "cacheblend_adaptive":
-                # Extension C: adaptive r (cosine divergence) fed into HKVD fusor.
-                adaptive_r = selector.compute_r(chunk_ids, chunk_kv)
+                # Extension C: fusor derives adaptive r from layer-0 L2 deviation internally.
+                # Single forward pass — no separate compute_r() call needed.
                 hit_mask = torch.ones(chunk_ids.shape[1], device=chunk_ids.device, dtype=torch.bool)
-                chunk_kv, _ = fusor.fuse(chunk_ids, chunk_kv, hit_mask, r=adaptive_r)
+                chunk_kv, _ = fusor.fuse(chunk_ids, chunk_kv, hit_mask, adaptive=True)
             elif mode == "standard_cache":
                 pass
             else:

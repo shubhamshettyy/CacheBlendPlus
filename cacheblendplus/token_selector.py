@@ -284,33 +284,65 @@ def select_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CacheBlendFusor:
-    def __init__(self, model, r: float = 0.15, r1_factor: float = 1.33):
+    def __init__(
+        self,
+        model,
+        r: float = 0.15,
+        r1_factor: float = 1.33,
+        adaptive_min_r: Optional[float] = None,
+        adaptive_max_r: Optional[float] = None,
+        adaptive_low_thresh: float = 0.20,
+        adaptive_high_thresh: float = 0.70,
+    ):
         self.model     = model
         self.r         = r
         self.r1_factor = r1_factor
         self.r1        = min(r * r1_factor, 1.0)
         self.layers    = get_model_layers(model)
-        self.L        = len(self.layers)
+        self.L         = len(self.layers)
 
-        self.n_heads = model.config.num_attention_heads
+        # Extension C adaptive budget thresholds (on normalized L2 deviation signal).
+        self.adaptive_min_r       = adaptive_min_r       if adaptive_min_r       is not None else max(0.05, r * 0.5)
+        self.adaptive_max_r       = adaptive_max_r       if adaptive_max_r       is not None else min(0.50, r * 2.0)
+        self.adaptive_low_thresh  = adaptive_low_thresh
+        self.adaptive_high_thresh = adaptive_high_thresh
+
+        self.n_heads    = model.config.num_attention_heads
         self.n_kv_heads = getattr(model.config, "num_key_value_heads", self.n_heads)
-        self.head_dim = model.config.hidden_size // self.n_heads
+        self.head_dim   = model.config.hidden_size // self.n_heads
 
-        # Safely extract rotary embeddings for LLaMA architectures
         is_llama = 'llama' in type(self.model).__name__.lower() or 'mistral' in type(self.model).__name__.lower()
         if is_llama:
-          if hasattr(self.model.model, 'rotary_emb'):
-              self.rotary_emb = self.model.model.rotary_emb
-          elif hasattr(self.layers[0].self_attn, 'rotary_emb'):
-              self.rotary_emb = self.layers[0].self_attn.rotary_emb
-          else:
-              raise AttributeError(
-                  "Cannot locate rotary_emb — check your transformers version"
-              )
+            if hasattr(self.model.model, 'rotary_emb'):
+                self.rotary_emb = self.model.model.rotary_emb
+            elif hasattr(self.layers[0].self_attn, 'rotary_emb'):
+                self.rotary_emb = self.layers[0].self_attn.rotary_emb
+            else:
+                raise AttributeError("Cannot locate rotary_emb — check your transformers version")
         else:
             self.rotary_emb = None
 
+        self.last_r_eff: float = r   # updated each fuse() call for observability
         self.model.eval()
+
+    def _adaptive_r_from_dev(self, dev0: torch.Tensor, hit_mask: torch.Tensor) -> float:
+        """
+        Extension C: map mean layer-0 L2 KV deviation to adaptive recompute ratio.
+        Uses x/(x+1) normalization so signal is always in [0,1) regardless of model scale.
+        """
+        valid = dev0[hit_mask & (dev0 < float('inf'))]
+        if valid.numel() == 0:
+            return self.r
+        mean_dev = float(valid.mean().item())
+        # x/(x+1) maps [0,∞) → [0,1) without needing scale calibration.
+        norm_div = mean_dev / (mean_dev + 1.0)
+        low, high = self.adaptive_low_thresh, self.adaptive_high_thresh
+        if norm_div <= low:
+            return self.adaptive_min_r
+        if norm_div >= high:
+            return self.adaptive_max_r
+        alpha = (norm_div - low) / max(high - low, 1e-8)
+        return self.adaptive_min_r + alpha * (self.adaptive_max_r - self.adaptive_min_r)
 
     def fuse(
         self,
@@ -318,32 +350,28 @@ class CacheBlendFusor:
         KV_new         : torch.Tensor,
         hit_mask       : torch.Tensor,
         r              : Optional[float] = None,
+        adaptive       : bool = False,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        # r overrides self.r at call time — used by Extension C adaptive mode.
+        """
+        r=None uses self.r (fixed).
+        r=<value> overrides ratio at call time.
+        adaptive=True derives r from layer-0 L2 deviation (Extension C, single pass).
+        """
         r_eff  = r if r is not None else self.r
         r1_eff = min(r_eff * self.r1_factor, 1.0)
 
-        N = full_input_ids.shape[1]
-        KV_new = KV_new.to(self.model.dtype)
+        N          = full_input_ids.shape[1]
+        KV_new     = KV_new.to(self.model.dtype)
         hkvd_per_layer = []
-
         miss_count = int((~hit_mask).sum().item())
-
-        k_targets = []
-        for i in range(1, self.L):
-            progress = i / (self.L - 1) if self.L > 1 else 1.0
-            target_ratio = r1_eff + (r_eff - r1_eff) * progress
-            k_targets.append(min(N, miss_count + max(1, int(target_ratio * N))))
-
-        is_llama = self.rotary_emb is not None
+        is_llama   = self.rotary_emb is not None
 
         with torch.no_grad():
             hidden = get_embeddings(self.model, full_input_ids)
-
             if is_llama:
                 position_ids = torch.arange(N, device=full_input_ids.device).unsqueeze(0)
 
-            # -- LAYER 0 --
+            # ── LAYER 0 (full forward, compute KV deviation) ───────────────
             cached_K0 = KV_new[0, 0].clone()
             cached_V0 = KV_new[0, 1].clone()
 
@@ -355,16 +383,27 @@ class CacheBlendFusor:
             else:
                 fresh_K0, fresh_V0 = run_layer_full_gpt2_inplace(self.layers[0], hidden, KV_new[0])
 
-            dev0 = compute_deviation_l2(
-                fresh_K0, fresh_V0, cached_K0, cached_V0, ~hit_mask
-            )
+            dev0 = compute_deviation_l2(fresh_K0, fresh_V0, cached_K0, cached_V0, ~hit_mask)
+
+            # ── Extension C: re-derive r from layer-0 deviation (single pass) ─
+            if adaptive:
+                r_eff  = self._adaptive_r_from_dev(dev0, hit_mask)
+                r1_eff = min(r_eff * self.r1_factor, 1.0)
+
+            # k0 and k_targets computed after dev0 so adaptive path uses final r_eff
             k0 = min(N, miss_count + max(1, int(r1_eff * N)))
+            k_targets = []
+            for i in range(1, self.L):
+                progress     = i / (self.L - 1) if self.L > 1 else 1.0
+                target_ratio = r1_eff + (r_eff - r1_eff) * progress
+                k_targets.append(min(N, miss_count + max(1, int(target_ratio * N))))
+
             hkvd = select_topk(dev0, k0)
             hkvd_per_layer.append(hkvd)
 
-            # -- LAYERS 1 to L-1 (Gradual Filtering) --
+            # ── LAYERS 1 to L-1 (gradual filtering) ───────────────────────
             for i in range(1, self.L):
-                target_k = k_targets[i-1]
+                target_k = k_targets[i - 1]
 
                 cached_K_hkvd = KV_new[i, 0, hkvd].clone()
                 cached_V_hkvd = KV_new[i, 1, hkvd].clone()
@@ -384,9 +423,10 @@ class CacheBlendFusor:
                 )
 
                 local_top = select_topk(dev_i, min(len(hkvd), target_k))
-                hkvd = hkvd[local_top]
+                hkvd      = hkvd[local_top]
                 hkvd_per_layer.append(hkvd)
 
+        self.last_r_eff = r_eff
         return KV_new, hkvd_per_layer
 
     def get_stats(self, hkvd_per_layer: List[torch.Tensor], N: int) -> dict:
@@ -401,6 +441,7 @@ class CacheBlendFusor:
             "layer0_ratio"       : counts[0] / N if counts else 0,
             "final_layer_ratio"  : counts[-1] / N if counts else 0,
             "target_r"           : self.r,
+            "effective_r"        : self.last_r_eff,
             "corrected_total_ops": corrected_ops,
             "full_prefill_ops"   : full_ops,
             "true_savings_pct"   : (1 - corrected_ops / full_ops) * 100,
