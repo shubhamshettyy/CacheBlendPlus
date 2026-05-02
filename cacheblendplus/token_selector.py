@@ -401,3 +401,36 @@ class CacheBlendFusor:
             "full_prefill_ops"   : full_ops,
             "true_savings_pct"   : (1 - corrected_ops / full_ops) * 100,
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Simple fixed-ratio selector (used by eval_harness for Table 1/2 sweep)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TokenSelector:
+    """
+    Fixed-ratio token selector.  Picks k = ceil(k_ratio * N) evenly-spaced
+    token positions and returns them as a sorted int64 index tensor.
+
+    Interface matches AdaptiveTokenSelector.select so both classes are
+    drop-in interchangeable for eval_harness.py.
+    """
+
+    def __init__(self, k_ratio: float = 0.15):
+        if not (0.0 < k_ratio <= 1.0):
+            raise ValueError(f"k_ratio must be in (0, 1], got {k_ratio}")
+        self.k_ratio = float(k_ratio)
+
+    def select(self, chunk_ids: torch.Tensor, cached_kv: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            chunk_ids : (1, N) token IDs
+            cached_kv : (L, 2, N, H, D)  — accepted but unused; kept for API parity
+        Returns:
+            Sorted int64 index tensor of length k on the same device as chunk_ids.
+        """
+        N = int(chunk_ids.shape[1])
+        k = max(1, min(N, int(self.k_ratio * N)))
+        # Evenly spaced positions cover the full sequence range
+        indices = torch.linspace(0, N - 1, k, dtype=torch.int64, device=chunk_ids.device)
+        return torch.sort(indices).values

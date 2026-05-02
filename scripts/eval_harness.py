@@ -19,9 +19,20 @@ All results saved to JSON incrementally — safe to preempt and resume.
 import argparse
 import json
 import os
+import sys
 import time
 import torch
 from pathlib import Path
+
+# Make the package importable when run as a script from scripts/ or via %run
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+from cacheblendplus.pipeline import cacheblend_generate, KVBlender
+from cacheblendplus.kv_store import KVCacheStore
+from cacheblendplus.recompute_engine import SelectiveRecomputer
+from cacheblendplus.token_selector import TokenSelector
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +123,6 @@ def run_table1_table2(
     selector_class, store_class, recomputer, blender,
     output_dir, max_new_tokens=128
 ) -> dict:
-
-    from pipeline import cacheblend_generate
 
     outpath = Path(output_dir) / "table1_table2.json"
     results = {}
@@ -226,8 +235,6 @@ def run_table3(
     output_dir, k_ratio=0.15, max_new_tokens=128
 ) -> dict:
 
-    from pipeline import cacheblend_generate
-
     outpath = Path(output_dir) / "table3.json"
     results = {}
     if outpath.exists():
@@ -334,23 +341,19 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from kv_store import KVCacheStore
-    from recompute_engine import SelectiveRecomputer
-    from pipeline import KVBlender
-    from token_selector import TokenSelector
 
     try:
-        from adaptive_selector import AdaptiveSelector
+        from cacheblendplus.adaptive_selector import AdaptiveSelector
         print("AdaptiveSelector loaded")
     except ImportError:
-        print("WARNING: adaptive_selector.py not found — using TokenSelector for Table 3")
+        print("WARNING: adaptive_selector not found — using TokenSelector for Table 3")
         AdaptiveSelector = None
 
     try:
-        from semantic_kv_store import SemanticKVCacheStore
+        from cacheblendplus.semantic_kv_store import SemanticKVCacheStore
         print("SemanticKVCacheStore loaded")
     except ImportError:
-        print("NOTE: semantic_kv_store.py not found — Table 3 semantic column = N/A")
+        print("NOTE: semantic_kv_store not found — Table 3 semantic column = N/A")
         SemanticKVCacheStore = None
 
     print(f"Loading {args.model_id}...")
@@ -376,9 +379,18 @@ def main():
 
     t3 = {}
     if not args.skip_table3:
+        # AdaptiveSelector needs model as first arg; wrap into a k_ratio-only factory
+        # so run_table3 can call sel_cls(k_ratio=...) uniformly for all selector types.
+        if AdaptiveSelector is not None:
+            adaptive_factory = lambda k_ratio, _m=model: AdaptiveSelector(
+                _m, base_k_ratio=k_ratio
+            )
+        else:
+            adaptive_factory = None
+
         t3 = run_table3(
             model, tokenizer, samples,
-            TokenSelector, AdaptiveSelector,
+            TokenSelector, adaptive_factory,
             KVCacheStore, SemanticKVCacheStore,
             recomputer, blender,
             args.output_dir, k_ratio=0.15,
