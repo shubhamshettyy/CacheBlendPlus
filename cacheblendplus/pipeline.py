@@ -102,8 +102,20 @@ def cacheblend_generate(
         )
     
     # 3. Final Decode
-    prompt_ids = full_ids[:, current_offset:]
+    # Ensure we have at least the last token for generate if the prompt was fully cached
+    if current_offset >= full_ids.shape[1]:
+        # Prompt was part of chunks? Should not happen in RAG, but safety first.
+        prompt_ids = full_ids[:, -1:] 
+        current_offset -= 1
+    else:
+        prompt_ids = full_ids[:, current_offset:]
+
     past = unpack_kv(fused_kv)
+    
+    # Mistral requires a full attention mask covering the KV cache + current tokens
+    kv_len = fused_kv.shape[2]
+    total_len = kv_len + prompt_ids.shape[1]
+    attention_mask = torch.ones((1, total_len), device=prompt_ids.device)
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -111,6 +123,7 @@ def cacheblend_generate(
 
     gen_kwargs = {
         "past_key_values": past,
+        "attention_mask": attention_mask,
         "max_new_tokens": 1 if benchmark_first_token else max_new_tokens,
         "min_new_tokens": 1 if benchmark_first_token else min_new_tokens,
         "use_cache": True,
