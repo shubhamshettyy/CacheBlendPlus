@@ -109,16 +109,8 @@ def cacheblend_generate(
         torch.cuda.synchronize()
     t_decode_start = time.perf_counter()
 
-    context_len = fused_kv.shape[2]
-    cache_position = torch.arange(
-        context_len,
-        context_len + prompt_ids.shape[1],
-        device=prompt_ids.device
-    )
-
     gen_kwargs = {
         "past_key_values": past,
-        "cache_position": cache_position,
         "max_new_tokens": 1 if benchmark_first_token else max_new_tokens,
         "min_new_tokens": 1 if benchmark_first_token else min_new_tokens,
         "use_cache": True,
