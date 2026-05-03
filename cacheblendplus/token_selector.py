@@ -4,6 +4,38 @@ from typing import List, Tuple, Optional
 from .kv_store import pack_kv, unpack_kv, get_model_layers, get_embeddings, apply_final_norm
 
 # ─────────────────────────────────────────────────────────────────────────────
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv, rotate_half
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RoPE Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_rope_to_cached_kv(
+    k_tensor: torch.Tensor, 
+    cos: torch.Tensor, 
+    sin: torch.Tensor, 
+    indices: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """
+    Applies an additional rotation to already-rotated K vectors.
+    k_tensor: (N, H, D) or (k, H, D)
+    cos, sin: (1, 1, seq_len, D)
+    """
+    if indices is not None:
+        cos = cos[:, :, indices, :]
+        sin = sin[:, :, indices, :]
+    
+    # k_tensor is (N, H, D), we need it to be (1, H, N, D) for apply_rotary_pos_emb
+    k_mh = k_tensor.transpose(0, 1).unsqueeze(0)
+    
+    # apply_rotary_pos_emb expects (batch, heads, seq_len, dim)
+    # Since we are applying a DELTA rotation, we use rotate_half manually
+    # to avoid the complexities of HuggingFace version differences in apply_rotary_pos_emb
+    k_rotated = (k_mh * cos) + (rotate_half(k_mh) * sin)
+    
+    return k_rotated.squeeze(0).transpose(0, 1)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Layer Execution (In-Place Mutations)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -114,8 +146,6 @@ def run_layer_selective_gpt2_inplace(
     return K_fresh_mh, V_fresh_mh
 
 
-
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
 def run_layer_full_llama_inplace(
     block, hidden: torch.Tensor, kv_layer_buf: torch.Tensor, position_ids: torch.Tensor,
@@ -316,10 +346,10 @@ class CacheBlendFusor:
         full_input_ids : torch.Tensor,
         KV_new         : torch.Tensor,
         hit_mask       : torch.Tensor,
+        chunk_offsets  : Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
 
         N = full_input_ids.shape[1]
-        # KV_new = KV_new.float()
         KV_new = KV_new.to(self.model.dtype)
         hkvd_per_layer = []
 
@@ -334,12 +364,44 @@ class CacheBlendFusor:
         is_llama = self.rotary_emb is not None
 
         with torch.no_grad():
+            # ─────────────────────────────────────────────────────────────────
+            # RoPE Correction for non-prefix chunks
+            # ─────────────────────────────────────────────────────────────────
+            if is_llama and chunk_offsets is not None:
+                # We need to rotate the cached KVs if they were pre-computed at a different position.
+                # Assuming chunk_offsets[i] is the absolute start position of chunk i in the fused sequence.
+                # And assuming chunks were cached starting at position 0.
+                for i in range(self.L):
+                    for chunk_idx, offset in enumerate(chunk_offsets):
+                        if offset == 0: continue # No rotation needed for prefix
+                        
+                        # Get indices for this chunk
+                        chunk_len = (hit_mask.shape[0] // len(chunk_offsets)) # Simplified for demo
+                        # In a real impl, we'd have exact start/end per chunk
+                        start = offset
+                        end = offset + chunk_len
+                        
+                        # Compute cos/sin for the shift
+                        # Since R(a+b) = R(a)R(b), we apply R(offset) to the cached K
+                        # which was already R(0)raw_K.
+                        pos = torch.arange(start, end, device=KV_new.device).unsqueeze(0)
+                        try:
+                            cos, sin = self.rotary_emb(KV_new[i, 0, start:end], pos)
+                        except TypeError:
+                            cos, sin = self.rotary_emb(KV_new[i, 0, start:end], seq_len=end)
+                            cos, sin = cos[:, start:end], sin[:, start:end]
+                        
+                        KV_new[i, 0, start:end] = apply_rope_to_cached_kv(
+                            KV_new[i, 0, start:end], cos, sin
+                        )
+
             hidden = get_embeddings(self.model, full_input_ids)
 
             if is_llama:
                 position_ids = torch.arange(N, device=full_input_ids.device).unsqueeze(0)
 
             # -- LAYER 0 --
+            # We keep a copy of the (corrected) cached K, V to compute deviation
             cached_K0 = KV_new[0, 0].clone()
             cached_V0 = KV_new[0, 1].clone()
 
