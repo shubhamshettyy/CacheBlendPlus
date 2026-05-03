@@ -36,6 +36,7 @@ def cacheblend_generate(
     # 1. Gather/Prefill all chunks
     fused_kv_parts = []
     hit_mask_parts = []
+    chunk_ids_all = []
     chunk_offsets = []
     current_offset = 0
 
@@ -61,10 +62,6 @@ def cacheblend_generate(
                 out = model(chunk_ids, use_cache=True)
             chunk_kv = pack_kv(out.past_key_values)
             store.store(chunk_text, chunk_kv)
-            # A miss means we computed it "fresh" in context 0, but since we just 
-            # computed it, it's technically a "hit" for the fusion logic 
-            # (or we treat it as something that needs recompute if we want to be safe)
-            # Paper: misses are recomputed fully.
             hit_mask_parts.append(torch.zeros(N_c, dtype=torch.bool, device="cuda"))
         else:
             cache_hits += 1
@@ -72,20 +69,15 @@ def cacheblend_generate(
             hit_mask_parts.append(torch.ones(N_c, dtype=torch.bool, device="cuda"))
 
         fused_kv_parts.append(chunk_kv)
+        chunk_ids_all.append(chunk_ids)
         chunk_offsets.append(current_offset)
         current_offset += N_c
 
     fused_kv = torch.cat(fused_kv_parts, dim=2)
     hit_mask = torch.cat(hit_mask_parts, dim=0)
     
-    # Full prompt construction
-    all_chunks_text = " ".join(chunk_texts)
-    full_prompt_text = all_chunks_text + " " + prompt
-    full_ids = tokenizer(full_prompt_text, return_tensors="pt").input_ids.cuda()
-    
     # 2. Fuse and Recompute using the optimized Fusor
     if mode == "cacheblend":
-        # If selector is an AdaptiveSelector, we can use its k_ratio
         r = k_ratio
         if hasattr(selector, "k_ratio"):
             r = selector.k_ratio
@@ -93,13 +85,22 @@ def cacheblend_generate(
             r = selector.base_k_ratio
             
         fusor = CacheBlendFusor(model, r=r)
-        # Note: fused_kv is updated in-place by the fusor
+        
+        # USE CONCATENATED IDS TO ENSURE LENGTH MATCHES KV CACHE EXACTLY
+        full_ids_for_fusion = torch.cat(chunk_ids_all, dim=1)
+        
         fused_kv, _ = fusor.fuse(
-            full_ids[:, :current_offset], 
+            full_ids_for_fusion, 
             fused_kv, 
             hit_mask, 
             chunk_offsets=chunk_offsets
         )
+    
+    # Full prompt construction (only for the new prompt part)
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+    # Remove BOS if it exists and was already in the chunks
+    if prompt_ids[0, 0] == tokenizer.bos_token_id and current_offset > 0:
+        prompt_ids = prompt_ids[:, 1:]
     
     # 3. Final Decode
     # Ensure we have at least the last token for generate if the prompt was fully cached
